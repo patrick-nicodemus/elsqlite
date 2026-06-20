@@ -997,11 +997,17 @@ Preserves raw BLOB data as a text property for image preview."
         ;; Binary data (BLOB) - show size info but preserve raw data
         (let ((display-text (format "<BLOB:%d bytes>" (length val))))
           (propertize display-text 'elsqlite-raw-blob val))
-      ;; Regular text - truncate if too long, but preserve original
-      (if (> (length val) elsqlite-max-column-width)
-          (propertize (concat (substring val 0 elsqlite-max-column-width) "...")
-                      'elsqlite-original-value val)
-        val)))
+      ;; Regular text - collapse embedded newlines/tabs so a multi-line
+      ;; cell stays on one display row (otherwise the continuation restarts
+      ;; at column 0 and breaks column alignment), truncate if too long, and
+      ;; preserve the original value for recovery.
+      (let ((display (replace-regexp-in-string "[\n\r\t]" " " val)))
+        (cond
+         ((> (length display) elsqlite-max-column-width)
+          (propertize (concat (substring display 0 elsqlite-max-column-width) "...")
+                      'elsqlite-original-value val))
+         ((string= display val) val)
+         (t (propertize display 'elsqlite-original-value val))))))
 
    ;; Vector or other types (shouldn't happen but handle it)
    ((vectorp val)
