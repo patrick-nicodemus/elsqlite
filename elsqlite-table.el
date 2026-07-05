@@ -126,6 +126,12 @@ Returns a formatted database schema dump.")
 (defvar-local elsqlite-table--rows-loaded 0
   "Number of rows currently loaded from streaming query.")
 
+(defvar-local elsqlite-table--rowid-index nil
+  "Index of the hidden rowid column in the active statement's results.
+Non-nil only when the query exposes a rowid via the `elsqlite_rowid'
+alias.  The value is stripped from display and stored in each entry's
+id so `elsqlite-table-get-rowid' can recover it.")
+
 (defvar-local elsqlite-table--warning-shown nil
   "Whether warning threshold message has been shown for current query.")
 
@@ -443,8 +449,8 @@ Only shows preview when cursor is in the table buffer, not in SQL buffer."
                           ((or elsqlite-table--current-table
                                (eq elsqlite-table--view-type 'query))
                            ;; Show row position for table/query views
-                           (let* ((current-row (when (tabulated-list-get-id)
-                                                 (tabulated-list-get-id)))
+                           (let* ((current-row (let ((id (tabulated-list-get-id)))
+                                                 (if (consp id) (car id) id)))
                                   (total-rows elsqlite-table--rows-loaded)
                                   (has-more (and elsqlite-table--statement
                                                  (sqlite-more-p elsqlite-table--statement))))
@@ -982,6 +988,45 @@ Values longer than this will be truncated with \"...\"."
   :type 'integer
   :group 'elsqlite)
 
+(defun elsqlite-table--remove-nth (n list)
+  "Return a copy of LIST with the element at index N removed."
+  (append (cl-subseq list 0 n) (nthcdr (1+ n) list)))
+
+(defun elsqlite-table--add-rowid-column (sql)
+  "Inject a hidden rowid column into a plain SELECT * query SQL.
+Rewrites a leading `SELECT *' into `SELECT rowid AS \"elsqlite_rowid\", *'
+so the row's rowid can be recovered while staying hidden from display.
+Non-matching queries are returned unchanged.  The caller must be prepared
+for the rewritten SQL to fail to compile on WITHOUT ROWID tables."
+  (replace-regexp-in-string
+   "\\`\\([ \t\n]*\\)SELECT[ \t\n]+\\*"
+   "\\1SELECT rowid AS \"elsqlite_rowid\", *"
+   sql t))
+
+(defun elsqlite-table--rowid-index (columns)
+  "Return the index of the hidden rowid column in COLUMNS, or nil."
+  (cl-position "elsqlite_rowid" columns :test #'string=))
+
+(defun elsqlite-table--make-data-entry (index row rowid-index)
+  "Build a `tabulated-list-entries' entry for ROW at 1-based INDEX.
+The entry id is a cons (INDEX . ROWID): INDEX drives the mode-line row
+counter, ROWID is the SQLite rowid or nil.  When ROWID-INDEX is non-nil
+that column is pulled out of ROW as the rowid and hidden from display."
+  (let ((rowid (and rowid-index (nth rowid-index row)))
+        (display-row (if rowid-index
+                         (elsqlite-table--remove-nth rowid-index row)
+                       row)))
+    (list (cons index rowid)
+          (elsqlite-table--format-row-with-padding
+           (vconcat (mapcar #'elsqlite-table--format-value display-row))))))
+
+(defun elsqlite-table-get-rowid ()
+  "Return the SQLite rowid of the row at point, or nil if unavailable.
+Available for base-table views; nil for arbitrary queries, views, the
+schema browser, and WITHOUT ROWID tables."
+  (let ((id (tabulated-list-get-id)))
+    (and (consp id) (cdr id))))
+
 (defun elsqlite-table--format-value (val)
   "Format VAL for display in table.
 Truncates long strings and BLOBs to `elsqlite-max-column-width'.
@@ -1041,11 +1086,8 @@ Returns number of rows loaded, or nil if no statement active."
                (new-entries (cl-loop for row in batch-rows
                                      for i from start-index
                                      collect
-                                     (list i (elsqlite-table--format-row-with-padding
-                                             (vconcat
-                                              (mapcar (lambda (val)
-                                                        (elsqlite-table--format-value val))
-                                                      row)))))))
+                                     (elsqlite-table--make-data-entry
+                                      i row elsqlite-table--rowid-index))))
           ;; Append to existing entries (preserving header)
           (let ((header (car tabulated-list-entries))
                 (data (cdr tabulated-list-entries)))
@@ -1087,9 +1129,19 @@ If result contains \\='elsqlite_schema_dump column, show schema viewer instead."
 
   ;; Start timing
   (let ((start-time (current-time)))
-    ;; Create statement for streaming
-    (let* ((stmt (sqlite-select elsqlite--db sql nil 'set))
-           (columns (sqlite-columns stmt)))
+    ;; Create statement for streaming.  For plain SELECT * queries we
+    ;; inject a hidden rowid column; if that fails to compile (e.g. a
+    ;; WITHOUT ROWID table) fall back to the original SQL.
+    (let* ((exec-sql (elsqlite-table--add-rowid-column sql))
+           (stmt (if (string= exec-sql sql)
+                     (sqlite-select elsqlite--db sql nil 'set)
+                   (condition-case nil
+                       (sqlite-select elsqlite--db exec-sql nil 'set)
+                     (error (sqlite-select elsqlite--db sql nil 'set)))))
+           (columns (sqlite-columns stmt))
+           (rowid-index (elsqlite-table--rowid-index columns)))
+      (when rowid-index
+        (setq columns (elsqlite-table--remove-nth rowid-index columns)))
 
     ;; Check if this is a schema dump query
     (if (member "elsqlite_schema_dump" columns)
@@ -1125,6 +1177,7 @@ If result contains \\='elsqlite_schema_dump column, show schema viewer instead."
         ;; Initialize streaming state
         (setq elsqlite-table--statement stmt
               elsqlite-table--rows-loaded 0
+              elsqlite-table--rowid-index rowid-index
               elsqlite-table--warning-shown nil)
 
         (let ((table-name (elsqlite-db-extract-table-name sql)))
@@ -1146,18 +1199,22 @@ If result contains \\='elsqlite_schema_dump column, show schema viewer instead."
             (setq elsqlite-table--rows-loaded count)
 
             ;; Calculate optimal column widths based on first batch
+            ;; (with the hidden rowid column stripped from each row).
             (setq tabulated-list-format
-                  (elsqlite-table--calculate-column-widths columns initial-batch))
+                  (elsqlite-table--calculate-column-widths
+                   columns
+                   (if rowid-index
+                       (mapcar (lambda (r)
+                                 (elsqlite-table--remove-nth rowid-index r))
+                               initial-batch)
+                     initial-batch)))
 
             ;; Build entries with header row and proper padding
             (let ((data-entries (cl-loop for row in initial-batch
                                          for i from 1
                                          collect
-                                         (list i (elsqlite-table--format-row-with-padding
-                                                 (vconcat
-                                                  (mapcar (lambda (val)
-                                                            (elsqlite-table--format-value val))
-                                                          row)))))))
+                                         (elsqlite-table--make-data-entry
+                                          i row rowid-index))))
               (setq tabulated-list-entries
                     (elsqlite-table--add-header-to-entries data-entries))))
 
